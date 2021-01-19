@@ -11,6 +11,7 @@ import signal
 import time
 import tempfile
 import subprocess
+import psutil
 from shutil import which
 from contextlib import closing
 from getpass import getpass
@@ -23,15 +24,17 @@ CONNECT_TIMEOUT=10
 
 # ############################################
 
+exit_now = False
 wan_iface = None
 unpriv_user = None
 unpriv_uid = None
 redsocks = None
-sudo = None
 socks_port = None
 ssh_cmd = None
 redirect_port = None
-redsocks_pid = None
+redsocks_proc = None
+ssh_proc = None
+ssh_password = None
 
 # ############################################
 
@@ -55,6 +58,16 @@ def unpriv(cmd):
     return f"sudo -u {unpriv_user} {cmd}"
   else:
     return ["sudo", "-u", unpriv_user, ] + cmd
+
+# ############################################
+
+def killSubprocess(proc_pid):
+  process = psutil.Process(proc_pid)
+
+  for proc in process.children(recursive=True):
+    proc.kill()
+
+  process.kill()
 
 # ############################################
 
@@ -102,6 +115,8 @@ def parseArgs():
 # ##############################################
 
 def startRedsocks():
+  global redsocks_proc
+
   # Redsocks
   redsocks_conf = """
 base {
@@ -122,11 +137,11 @@ redsocks {
     temp.write(redsocks_conf.encode())
     temp.flush()
 
-    redsocks_cmd = ["redsocks", "-c", temp.name]
+    redsocks_cmd = unpriv(["redsocks", "-c", temp.name])
     log.debug(f"Running '{' '.join(redsocks_cmd)}'...")
-    redsocks_pid = os.spawnl(os.P_NOWAIT, sudo, *unpriv(redsocks_cmd))
+    redsocks_proc = subprocess.Popen(redsocks_cmd)
 
-    log.debug(f"redsocks spawned with PID {redsocks_pid}")
+    log.debug(f"redsocks spawned with PID {redsocks_proc.pid}")
 
     if not waitTCPPort("127.0.0.1", redirect_port):
       log.critical(f"redsocks TCP port {redirect_port} did not open")
@@ -185,14 +200,66 @@ def stopNetwork():
 
 # ##############################################
 
-def main(program):
-  # Wait for socket to be open
-  if not waitTCPPort("127.0.0.1", socks_port):
-    log.critical("Connection did not open, wrong password?")
-    return 1
+def startSSH():
+  global ssh_proc
 
-  rv = startRedsocks()
+  if ssh_proc:
+    ssh_proc.close(True)
+
+  log.debug(f"Running '{ssh_cmd}'...")
+  rv = 0
+
+  try:
+    ssh_proc = pexpect.spawn(unpriv(ssh_cmd), encoding='utf-8')
+    log.debug(f"SSH spawned with PID {ssh_proc.pid}")
+
+    ssh_proc.logfile_read = sys.stdout
+    ssh_proc.expect('assword:', timeout=5)
+
+    # NOTE: ssh_password is cached in memory
+    if not ssh_password:
+      ssh_password = getpass(prompt='')
+
+    ssh_proc.sendline(ssh_password)
+
+    # Wait for socket to be open
+    if not waitTCPPort("127.0.0.1", socks_port):
+      log.critical("Connection did not open, wrong password?")
+      rv = 1
+  except pexpect.exceptions.ExceptionPexpect as e:
+    log.debug("pexpect exception %s" % e.__class__.__name__)
+    rv = 1
+
   if rv != 0:
+    ssh_proc.close(True)
+
+  return rv
+
+# ##############################################
+
+def termHandler(*args):
+  global exit_now
+
+  if not exit_now:
+    log.info("Terminating...")
+    exit_now = True
+  else:
+    log.info("Exit now")
+    exit(1)
+
+# ##############################################
+
+def main(program):
+  ns_proc = None
+  max_reconnect_t = 600 # 10 minutes
+  reconnect_t = 5 # initial reconnect timeout
+  next_ssh = 0
+
+  # Start SSH and network
+  rv = startSSH()
+
+  if rv != 0:
+    log.error("SSH connection failed")
     return rv
 
   stopNetwork()
@@ -201,6 +268,7 @@ def main(program):
   if rv != 0:
     return rv
 
+  # Start main process
   rc_conf = """
 source $HOME/.bashrc
 PS1="(%s) $ "
@@ -219,9 +287,40 @@ PS1="(%s) $ "
     log.debug(f"Running '{' '.join(cmd)}'...")
 
     log.info("Starting namespace...")
-    p = subprocess.Popen(cmd)
-    p.communicate()
-    rv = p.returncode
+    ns_proc = subprocess.Popen(cmd)
+
+  signal.signal(signal.SIGINT, termHandler)
+  signal.signal(signal.SIGTERM, termHandler)
+  signal.signal(signal.SIGHUP, termHandler)
+
+  # Monitor SSH / main process
+  while not exit_now:
+    time.sleep(1)
+
+    if exit_now:
+      break
+
+    rc = ns_proc.poll()
+
+    if rc != None:
+      log.info("Namespace closed, terminating")
+      rv = rc
+      break
+
+    if (not ssh_proc.isalive()) and (time.time() >= next_ssh):
+      rc = startSSH()
+
+      if rc != 0:
+        log.info("\nSSH connection failed, retrying in %d sec", reconnect_t)
+        next_ssh = time.time() + reconnect_t
+        reconnect_t = min(reconnect_t * 2, max_reconnect_t)
+      else:
+        reconnect_t = 0
+
+  # Termination
+  stopNetwork()
+
+  ssh_proc.close(True)
 
   return rv
 
@@ -253,8 +352,7 @@ if __name__ == "__main__":
     log.critical("Cannot find 'ssh'. Is openssh installed?")
     exit(1)
 
-  sudo = which("sudo")
-  if not sudo:
+  if not which("sudo"):
     log.critical("Cannot find 'sudo'. Is sudo installed?")
     exit(1)
 
@@ -269,26 +367,17 @@ if __name__ == "__main__":
   # SSH tunnel
   ssh_cmd = ["ssh", "-D", str(socks_port), "-qCNp", str(args.ssh_port), args.ssh_host]
   ssh_cmd = ' '.join(ssh_cmd)
-  log.debug(f"Running '{ssh_cmd}'...")
 
-  ssh = pexpect.spawn(unpriv(ssh_cmd), encoding='utf-8')
-  log.debug(f"SSH spawned with PID {ssh.pid}")
+  rv = startRedsocks()
 
-  ssh.logfile_read = sys.stdout
-  ssh.expect('assword:')
-  ssh.sendline(getpass(prompt=''))
+  if rv != 0:
+    log.critical("Could not start redsocks")
+    exit(1)
 
   rv = main(args.program)
 
-  # Termination
-  log.info("Cleaning up...")
-
-  stopNetwork()
-
-  if not ssh.terminate():
-    ssh.kill(signal.SIGKILL)
-
-  if redsocks_pid:
-    os.kill(redsocks_pid, signal.SIGTERM)  
+  if redsocks_proc:
+    log.debug(f"Killing redsocks ({redsocks_proc.pid})")
+    killSubprocess(redsocks_proc.pid)
 
   exit(rv)

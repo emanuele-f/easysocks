@@ -17,8 +17,6 @@ E.g:
 
 will return the IP address of the machine where the SSH server is running.
 
-*Important*: any protococol other than TCP (e.g. DNS queries, ping) will *not* be tunneled! It will go straight out of your machine.
-
 Requirements
 ------------
 
@@ -29,6 +27,14 @@ The following dependencies are required:
 The ssh server must have the dynamic forwarding enabled:
   - `AllowTcpForwarding yes` for openssh
   - `/ip ssh set forwarding-enabled=local` on RouterOS
+
+Notes
+-----
+
+  - Any protococol other than TCP (e.g. DNS queries, ping) will *not* be tunneled! It will go straight out of your machine.
+  - An SSH server with password autentication is required
+  - The SSH server should be already known (should be in `.ssh/known_hosts`)
+  - The SSH password is stored in memory as easysocks monitors the SSH connection and restarts it when necessary
 
 How it Works
 ------------
@@ -45,3 +51,4 @@ TODO
 - Support multiple instances by randomizing veth interface address (currently `172.16.1.1`)
 - Allow custom ssh options to be specified
 - Allow custom redsocks options to be specified
+- Support public key ssh connections

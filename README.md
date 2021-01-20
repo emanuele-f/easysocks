@@ -23,6 +23,7 @@ Requirements
 The following dependencies are required:
   - `redsocks`
   - `python-pexpect`
+  - `python-psutil`
 
 The ssh server must have the dynamic forwarding enabled:
   - `AllowTcpForwarding yes` for openssh

@@ -202,6 +202,7 @@ def stopNetwork():
 
 def startSSH():
   global ssh_proc
+  global ssh_password
 
   if ssh_proc:
     ssh_proc.close(True)
@@ -311,7 +312,7 @@ PS1="(%s) $ "
       rc = startSSH()
 
       if rc != 0:
-        log.info("\nSSH connection failed, retrying in %d sec", reconnect_t)
+        log.debug("\nSSH connection failed, retrying in %d sec", reconnect_t)
         next_ssh = time.time() + reconnect_t
         reconnect_t = min(reconnect_t * 2, max_reconnect_t)
       else:
